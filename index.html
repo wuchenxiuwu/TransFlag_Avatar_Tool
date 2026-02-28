@@ -421,8 +421,11 @@
                     this.flagScale = 1.0; // 缩放倍数
                     this.flagRotation = 0; // 旋转角度，0-360
 
-                    this.processCanvas = document.createElement('canvas'); // 离屏画布，存原始分辨率图像
+                    // 离屏画布，存原始分辨率图像 —— 妈的这回要好好利用，不能每次都重绘头像
+                    this.processCanvas = document.createElement('canvas');
                     this.processCtx = this.processCanvas.getContext('2d');
+                    // 标记离屏画布是否需要重绘（头像变了或旗帜变换了）
+                    this.offscreenDirty = true;
 
                     // DOM 元素，全他妈抓出来
                     this.avatarUpload = document.getElementById('avatarUpload');
@@ -452,11 +455,25 @@
                     this.touchActive = false;          // 是否正在触摸拖动
                     this.touchCanvas = null;            // 触发触摸的画布
                     this.touchLast = { x:0, y:0 };      // 上一次触摸点（预览坐标）
+                    // 双指触摸专用 —— 为了缩放旋转，妈的多点触控终于安排上了
+                    this.touchPinch = {
+                        active: false,
+                        startDist: 0,
+                        startAngle: 0,
+                        startScale: 1.0,
+                        startRotation: 0
+                    };
 
                     this.history = []; // 历史记录数组，用于撤销重做
                     this.historyIndex = -1; // 当前历史索引
                     this.maxHistory = 20; // 最多存20步
                     this.saveTimer = null; // 延迟保存定时器
+
+                    // 新增：flagRect 显式声明，省得看着别扭
+                    this.flagRect = null;
+
+                    // 动画帧节流用的标志
+                    this.redrawScheduled = false;
 
                     // 绑定this，省得回调里搞丢
                     this.handleFileChange = this.handleFileChange.bind(this);
@@ -488,6 +505,7 @@
                         if (img) this.flagImage = img;
                         else console.warn('默认旗帜加载失败'); // 加载不了就算了，反正后面有虚拟框
                         if (this.originalImage) this.resetTransform(FLAG_TEMPLATES[0].defaultScale);
+                        this.offscreenDirty = true; // 旗帜变了，离屏画布得重绘
                         this.drawAll();
                     });
 
@@ -559,6 +577,7 @@
                             item.classList.toggle('selected', item.dataset.key === key);
                         });
                         this.resetTransform(template.defaultScale || 1.0); // 重置变换到默认缩放要是想改，可以改不改之前建议掂量掂量这AI的实力，别他妈到时候又整出幺蛾子了
+                        this.offscreenDirty = true;
                         this.saveState();
                     });
                 }
@@ -609,6 +628,7 @@
                     this.flagScale = val;
                     this.scaleSlider.value = val;
                     this.scaleInput.value = val.toFixed(2);
+                    this.offscreenDirty = true; // 缩放变了，旗帜要重绘
                     this.drawAll();
                     this.deferredSaveState();
                 }
@@ -620,6 +640,7 @@
                     this.flagRotation = val;
                     this.rotationSlider.value = val;
                     this.rotationInput.value = val;
+                    this.offscreenDirty = true; // 旋转变了，旗帜要重绘
                     this.drawAll();
                     this.deferredSaveState();
                 }
@@ -632,6 +653,7 @@
                     this.scaleInput.value = scale.toFixed(2);
                     this.rotationSlider.value = 0;
                     this.rotationInput.value = 0;
+                    this.offscreenDirty = true;
                     this.drawAll();
                     this.saveState();
                 }
@@ -676,6 +698,7 @@
                             this.downloadBtn.disabled = false;
                             const template = FLAG_TEMPLATES.find(t => t.key === this.currentFlagKey);
                             this.resetTransform(template ? template.defaultScale : 1.0);
+                            this.offscreenDirty = true; // 新头像，离屏画布必须重绘
                             this.saveState(true);
                         };
                         img.src = e.target.result;
@@ -699,41 +722,37 @@
                     return { scale, offsetX, offsetY };
                 }
 
-                previewToProcess(x, y) {
-                    const t = this.getPreviewTransform();
-                    return { x: (x - t.offsetX) / t.scale, y: (y - t.offsetY) / t.scale };
-                }
+                // 删掉了没用的 previewToProcess，压根没人调用 —— 2025-02-28
 
                 processToPreview(x, y) {
                     const t = this.getPreviewTransform();
                     return { x: x * t.scale + t.offsetX, y: y * t.scale + t.offsetY };
                 }
 
-                drawAll() {
-                    // 绘制离屏画布
-                    if (this.originalImage) {
-                        this.processCtx.clearRect(0, 0, this.processCanvas.width, this.processCanvas.height);
-                        this.processCtx.drawImage(this.originalImage, 0, 0);
-                    }
+                // 专门重绘离屏画布（原始分辨率），只有头像或旗帜变换时才调用
+                redrawOffscreen() {
+                    if (!this.originalImage) return;
 
-                    // 计算旗帜尺寸
-                    const base = this.originalImage ? Math.min(this.originalImage.width, this.originalImage.height) : this.CANVAS_SIZE;
+                    // 清空并绘制头像
+                    this.processCtx.clearRect(0, 0, this.processCanvas.width, this.processCanvas.height);
+                    this.processCtx.drawImage(this.originalImage, 0, 0);
+
+                    // 计算旗帜尺寸（跟原来一样）
+                    const base = Math.min(this.originalImage.width, this.originalImage.height);
                     const flagBaseSize = base * this.FLAG_SIZE_RATIO;
                     let flagW, flagH;
 
                     if (this.flagImage && this.flagImage.complete && this.flagImage.naturalWidth > 0) {
-                        // 有图片，按图片比例
                         flagW = flagBaseSize * this.flagScale;
                         flagH = (this.flagImage.height / this.flagImage.width) * flagBaseSize * this.flagScale;
                     } else {
-                        // 没图片，用预设宽高比
                         const template = FLAG_TEMPLATES.find(t => t.key === this.currentFlagKey);
                         const aspect = template ? template.aspectRatio : 2;
                         flagW = flagBaseSize * this.flagScale;
                         flagH = flagW / aspect;
                     }
 
-                    // 计算默认位置（不同旗帜位置不同）
+                    // 计算默认位置
                     let defaultX, defaultY;
                     if (this.currentFlagKey.startsWith('bottom')) {
                         defaultX = (this.originalImage.width - flagW) / 2;
@@ -751,15 +770,35 @@
                     const flagCx = flagX + flagW / 2;
                     const flagCy = flagY + flagH / 2;
 
+                    // 保存flagRect供预览画控制点用
                     this.flagRect = { x: flagX, y: flagY, w: flagW, h: flagH, cx: flagCx, cy: flagCy };
 
-                    // 如果有旗帜图片，绘制到离屏画布没图片，直接报错
+                    // 绘制旗帜
                     if (this.flagImage && this.flagImage.complete && this.flagImage.naturalWidth > 0) {
                         this.processCtx.save();
                         this.processCtx.translate(flagCx, flagCy);
                         this.processCtx.rotate(this.flagRotation * Math.PI / 180);
                         this.processCtx.drawImage(this.flagImage, -flagW / 2, -flagH / 2, flagW, flagH);
                         this.processCtx.restore();
+                    }
+
+                    this.offscreenDirty = false; // 已经干净了
+                }
+
+                // 节流绘制：把所有对drawAll的调用都扔到requestAnimationFrame里
+                scheduleDraw() {
+                    if (this.redrawScheduled) return;
+                    this.redrawScheduled = true;
+                    requestAnimationFrame(() => {
+                        this.redrawScheduled = false;
+                        this.drawAll();
+                    });
+                }
+
+                drawAll() {
+                    // 如果离屏画布脏了，先重绘离屏画布
+                    if (this.offscreenDirty && this.originalImage) {
+                        this.redrawOffscreen();
                     }
 
                     // 更新三个预览画布
@@ -800,22 +839,24 @@
                         this.circularCtx.stroke();
                     }
 
-                    // 绘制控制点（虚线框和手柄）
+                    // 绘制控制点（复用计算好的flagRect）
                     if (this.flagRect) {
-                        this.drawControls(this.imageCtx);
-                        this.drawControls(this.circularCtx);
+                        // 先计算一次控制点坐标，然后分别绘制到两个画布
+                        const controlsData = this.calcControlPoints();
+                        this.drawControlsOnCanvas(this.imageCtx, controlsData);
+                        this.drawControlsOnCanvas(this.circularCtx, controlsData);
                     }
                 }
 
-                drawControls(ctx) {
-                    if (!this.flagRect) return;
-
+                // 计算控制点坐标（基于flagRect和旋转角度）
+                calcControlPoints() {
+                    if (!this.flagRect) return null;
                     const { x, y, w, h, cx, cy } = this.flagRect;
                     const angle = this.flagRotation * Math.PI / 180;
                     const cos = Math.cos(angle);
                     const sin = Math.sin(angle);
 
-                    // 计算四个角在预览画布上的坐标
+                    // 四个角（用于虚线框）—— 其实只需要角点坐标，但为了复用，把角点也算出来
                     const corners = [
                         { x: -w/2, y: -h/2 },
                         { x:  w/2, y: -h/2 },
@@ -827,8 +868,48 @@
                         return this.processToPreview(rx, ry);
                     });
 
+                    // 中心点
+                    const center = this.processToPreview(cx, cy);
+
+                    // 缩放点（右上角）
+                    const scalePt = corners[1]; // 右上
+
+                    // 旋转手柄（顶部中点向外延伸）—— 这下写清晰了，操
+                    // 顶部中点原始坐标 (cx, cy - h/2)
+                    const topMidRaw = { x: cx, y: cy - h/2 };
+                    // 旋转后顶部中点
+                    const topMidRotated = {
+                        x: cx + (topMidRaw.x - cx) * cos - (topMidRaw.y - cy) * sin,
+                        y: cy + (topMidRaw.x - cx) * sin + (topMidRaw.y - cy) * cos
+                    };
+                    // 手柄长度（预览坐标系30px）
+                    const handleLength = 30;
+                    // 直接计算预览坐标
+                    const t = this.getPreviewTransform();
+                    const handleEndRaw = {
+                        x: topMidRotated.x + sin * (handleLength / t.scale),
+                        y: topMidRotated.y - cos * (handleLength / t.scale)
+                    };
+                    const rotatePt = this.processToPreview(handleEndRaw.x, handleEndRaw.y);
+                    const topMidPreview = this.processToPreview(topMidRotated.x, topMidRotated.y);
+
+                    return {
+                        corners,
+                        center,
+                        scale: scalePt,
+                        rotate: rotatePt,
+                        rotateLineStart: topMidPreview,
+                        rotateLineEnd: rotatePt
+                    };
+                }
+
+                // 在指定画布上绘制控制点
+                drawControlsOnCanvas(ctx, data) {
+                    if (!data) return;
+                    const { corners, center, scale, rotate, rotateLineStart, rotateLineEnd } = data;
+
                     ctx.save();
-                    // 画虚线边框，如果中心激活就变红。变红，这就说明你的环境有问题自己去适配
+                    // 画虚线边框，如果中心激活就变红。没变红，这就说明你的环境有问题自己去适配
                     ctx.strokeStyle = this.activeControl === 'center' ? 'red' : '#007bff';
                     ctx.lineWidth = 2;
                     ctx.setLineDash([5, 5]);
@@ -840,10 +921,9 @@
                     ctx.setLineDash([]);
 
                     // 中心控制点
-                    const centerPreview = this.processToPreview(cx, cy);
-                    this.controlPoints.center = centerPreview;
+                    this.controlPoints.center = center; // 更新全局controlPoints供点击检测
                     ctx.beginPath();
-                    ctx.arc(centerPreview.x, centerPreview.y, 8, 0, 2*Math.PI);
+                    ctx.arc(center.x, center.y, 8, 0, 2*Math.PI);
                     ctx.fillStyle = this.activeControl === 'center' ? 'red' : 'rgba(0,123,255,0.8)';
                     ctx.fill();
                     ctx.strokeStyle = 'white';
@@ -851,38 +931,25 @@
                     ctx.stroke();
 
                     // 缩放点（右上角）
-                    const scalePreview = corners[1];
-                    this.controlPoints.scale = scalePreview;
+                    this.controlPoints.scale = scale;
                     ctx.beginPath();
-                    ctx.arc(scalePreview.x, scalePreview.y, 8, 0, 2*Math.PI);
+                    ctx.arc(scale.x, scale.y, 8, 0, 2*Math.PI);
                     ctx.fillStyle = this.activeControl === 'scale' ? 'red' : 'rgba(255,0,0,0.9)';
                     ctx.fill();
                     ctx.stroke();
 
-                    // 旋转手柄（顶部中点向外延伸）
-                    const topMidRaw = { x: cx, y: cy - h/2 };
-                    const topMidRotated = {
-                        x: cx + (0)*cos - (-h/2)*sin,
-                        y: cy + (0)*sin + (-h/2)*cos
-                    };
-                    const topMidPreview = this.processToPreview(topMidRotated.x, topMidRotated.y);
-                    const handleLength = 30;
-                    const handleEndRaw = {
-                        x: topMidRotated.x + sin * (handleLength / this.getPreviewTransform().scale),
-                        y: topMidRotated.y - cos * (handleLength / this.getPreviewTransform().scale)
-                    };
-                    const handleEndPreview = this.processToPreview(handleEndRaw.x, handleEndRaw.y);
-
+                    // 旋转手柄线
                     ctx.beginPath();
-                    ctx.moveTo(topMidPreview.x, topMidPreview.y);
-                    ctx.lineTo(handleEndPreview.x, handleEndPreview.y);
+                    ctx.moveTo(rotateLineStart.x, rotateLineStart.y);
+                    ctx.lineTo(rotateLineEnd.x, rotateLineEnd.y);
                     ctx.strokeStyle = this.activeControl === 'rotate' ? 'red' : '#ff9800';
                     ctx.lineWidth = 3;
                     ctx.stroke();
 
-                    this.controlPoints.rotate = handleEndPreview;
+                    // 旋转点
+                    this.controlPoints.rotate = rotate;
                     ctx.beginPath();
-                    ctx.arc(handleEndPreview.x, handleEndPreview.y, 8, 0, 2*Math.PI);
+                    ctx.arc(rotate.x, rotate.y, 8, 0, 2*Math.PI);
                     ctx.fillStyle = this.activeControl === 'rotate' ? 'red' : 'rgba(255,152,0,0.9)';
                     ctx.fill();
                     ctx.stroke();
@@ -897,7 +964,7 @@
                         const pt = this.controlPoints[key];
                         if (pt && Math.hypot(x - pt.x, y - pt.y) <= threshold) return key;
                     }
-                    // 如果点靠近中心一定范围，也视为中心拖动没拖动或者拖不动就自己修改不过要注意模块化。没模块化再写的这么烂自己去处理
+                    // 如果点靠近中心一定范围（60px），也视为中心拖动——这样拖动中心区域更方便
                     if (this.flagRect) {
                         const distToCenter = Math.hypot(x - this.controlPoints.center.x, y - this.controlPoints.center.y);
                         if (distToCenter < 60) return 'center';
@@ -927,7 +994,7 @@
                     if (this.activeControl === 'center') e.target.style.cursor = 'move';
                     else if (this.activeControl === 'scale') e.target.style.cursor = 'nwse-resize';
                     else if (this.activeControl === 'rotate') e.target.style.cursor = 'crosshair';
-                    this.drawAll();
+                    this.scheduleDraw(); // 用节流重绘
                 }
 
                 handleMouseMove(e) {
@@ -970,7 +1037,8 @@
                     }
 
                     this.lastMouse = { x: currentX, y: currentY };
-                    this.drawAll();
+                    this.offscreenDirty = true; // 旗帜变换，离屏画布脏了
+                    this.scheduleDraw();
                     this.deferredSaveState();
                 }
 
@@ -980,61 +1048,137 @@
                         this.activeControl = null;
                         this.imageCanvas.style.cursor = 'pointer';
                         this.circularCanvas.style.cursor = 'pointer';
-                        this.drawAll();
+                        this.scheduleDraw();
                         this.saveState();
                     }
                 }
 
-                // ------触摸----------
+                // ------触摸----------（独立逻辑，但增加了双指缩放旋转）
                 handleTouchStart(e) {
                     if (!this.originalImage) return;
                     e.preventDefault();
 
-                    const touch = e.touches[0];
-                    if (!touch) return;
+                    const touches = e.touches;
+                    if (touches.length === 1) {
+                        // 单指：拖动中心
+                        const touch = touches[0];
+                        const rect = e.target.getBoundingClientRect();
+                        const x = touch.clientX - rect.left;
+                        const y = touch.clientY - rect.top;
 
-                    this.touchCanvas = e.target;
-                    const rect = this.touchCanvas.getBoundingClientRect();
-                    const x = touch.clientX - rect.left;
-                    const y = touch.clientY - rect.top;
+                        this.touchActive = true;
+                        this.touchCanvas = e.target;
+                        this.touchLast = { x, y };
+                        this.activeControl = 'center'; // 触摸时强制高亮中心，让虚线变红
+                        this.touchPinch.active = false; // 关闭双指模式
+                        this.scheduleDraw();
+                    } else if (touches.length === 2) {
+                        // 双指：准备缩放旋转
+                        this.touchActive = true;
+                        this.touchCanvas = e.target;
+                        this.activeControl = null; // 双指时不单独高亮控制点
+                        this.touchPinch.active = true;
 
-                    this.touchActive = true;
-                    this.touchLast = { x, y };
-                    this.activeControl = 'center'; // 触摸时强制高亮中心，让虚线变红
-                    this.drawAll();
+                        const touch1 = touches[0];
+                        const touch2 = touches[1];
+                        const rect = e.target.getBoundingClientRect();
+                        const p1 = { x: touch1.clientX - rect.left, y: touch1.clientY - rect.top };
+                        const p2 = { x: touch2.clientX - rect.left, y: touch2.clientY - rect.top };
+
+                        // 计算初始距离和角度
+                        const dx = p2.x - p1.x;
+                        const dy = p2.y - p1.y;
+                        this.touchPinch.startDist = Math.hypot(dx, dy);
+                        this.touchPinch.startAngle = Math.atan2(dy, dx);
+                        this.touchPinch.startScale = this.flagScale;
+                        this.touchPinch.startRotation = this.flagRotation;
+
+                        // 这行没用，删了 —— 2025-02-28
+                        // this.dragStartState = { ... }; 
+                    }
                 }
 
                 handleTouchMove(e) {
                     if (!this.touchActive || !this.touchCanvas) return;
                     e.preventDefault();
 
-                    const touch = e.touches[0];
-                    if (!touch) return;
+                    const touches = e.touches;
+                    if (touches.length === 1 && !this.touchPinch.active) {
+                        // 单指拖动
+                        const touch = touches[0];
+                        const rect = this.touchCanvas.getBoundingClientRect();
+                        const currentX = touch.clientX - rect.left;
+                        const currentY = touch.clientY - rect.top;
 
-                    const rect = this.touchCanvas.getBoundingClientRect();
-                    const currentX = touch.clientX - rect.left;
-                    const currentY = touch.clientY - rect.top;
+                        const deltaX = currentX - this.touchLast.x;
+                        const deltaY = currentY - this.touchLast.y;
+                        const t = this.getPreviewTransform();
 
-                    const deltaX = currentX - this.touchLast.x;
-                    const deltaY = currentY - this.touchLast.y;
-                    const t = this.getPreviewTransform();
+                        this.flagOffset.x += deltaX / t.scale;
+                        this.flagOffset.y += deltaY / t.scale;
 
-                    // 增量更新：在当前 flagOffset 上累加位移（这样就不会回弹了）
-                    this.flagOffset.x += deltaX / t.scale;
-                    this.flagOffset.y += deltaY / t.scale;
+                        this.touchLast = { x: currentX, y: currentY };
+                        this.offscreenDirty = true;
+                        this.scheduleDraw();
+                        this.deferredSaveState();
+                    } else if (touches.length === 2 && this.touchPinch.active) {
+                        // 双指缩放旋转
+                        const touch1 = touches[0];
+                        const touch2 = touches[1];
+                        const rect = this.touchCanvas.getBoundingClientRect();
+                        const p1 = { x: touch1.clientX - rect.left, y: touch1.clientY - rect.top };
+                        const p2 = { x: touch2.clientX - rect.left, y: touch2.clientY - rect.top };
 
-                    this.touchLast = { x: currentX, y: currentY };
-                    this.drawAll();
-                    this.deferredSaveState();
+                        const dx = p2.x - p1.x;
+                        const dy = p2.y - p1.y;
+                        const currentDist = Math.hypot(dx, dy);
+                        const currentAngle = Math.atan2(dy, dx);
+
+                        if (this.touchPinch.startDist > 0) {
+                            // 缩放因子
+                            const scaleRatio = currentDist / this.touchPinch.startDist;
+                            this.flagScale = this.touchPinch.startScale * scaleRatio;
+                            this.flagScale = Math.min(3.0, Math.max(0.5, this.flagScale));
+                            this.scaleSlider.value = this.flagScale;
+                            this.scaleInput.value = this.flagScale.toFixed(2);
+
+                            // 旋转角度
+                            let angleDelta = (currentAngle - this.touchPinch.startAngle) * 180 / Math.PI;
+                            let newRotation = this.touchPinch.startRotation + angleDelta;
+                            this.flagRotation = Math.min(360, Math.max(0, newRotation));
+                            this.rotationSlider.value = this.flagRotation;
+                            this.rotationInput.value = this.flagRotation;
+                        }
+
+                        this.offscreenDirty = true;
+                        this.scheduleDraw();
+                        this.deferredSaveState();
+                    }
                 }
 
                 handleTouchEnd(e) {
                     if (this.touchActive) {
-                        this.touchActive = false;
-                        this.touchCanvas = null;
-                        this.activeControl = null;
-                        this.drawAll();
-                        this.saveState();
+                        // 如果手指抬起后还有触摸，但少于2指，要重置双指状态
+                        if (e.touches.length === 0) {
+                            // 全部抬起，结束触摸
+                            this.touchActive = false;
+                            this.touchCanvas = null;
+                            this.activeControl = null;
+                            this.touchPinch.active = false;
+                            this.scheduleDraw();
+                            this.saveState();
+                        } else if (e.touches.length === 1) {
+                            // 从双指变为单指，转换为单指拖动模式
+                            this.touchPinch.active = false;
+                            this.activeControl = 'center';
+                            // 重新记录单指位置
+                            const touch = e.touches[0];
+                            const rect = this.touchCanvas.getBoundingClientRect();
+                            this.touchLast = {
+                                x: touch.clientX - rect.left,
+                                y: touch.clientY - rect.top
+                            };
+                        }
                     }
                 }
                 // ---------- 触摸事件结束 ----------
@@ -1068,8 +1212,11 @@
                 }
 
                 deferredSaveState() {
-                    if (this.saveTimer) clearTimeout(this.saveTimer);
-                    this.saveTimer = setTimeout(() => this.saveState(), 300);
+                    if (this.saveTimer) cancelAnimationFrame(this.saveTimer);
+                    this.saveTimer = requestAnimationFrame(() => {
+                        this.saveState();
+                        this.saveTimer = null;
+                    });
                 }
 
                 loadState(state) {
@@ -1084,6 +1231,7 @@
                                 if (img) this.flagImage = img;
                                 else this.flagImage = null;
                                 this.renderFlagGallery();
+                                this.offscreenDirty = true;
                                 this.drawAll();
                             });
                         }
@@ -1092,6 +1240,7 @@
                     this.scaleInput.value = this.flagScale.toFixed(2);
                     this.rotationSlider.value = this.flagRotation;
                     this.rotationInput.value = this.flagRotation;
+                    this.offscreenDirty = true;
                     this.drawAll();
                 }
 
