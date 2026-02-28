@@ -897,7 +897,7 @@
                         const pt = this.controlPoints[key];
                         if (pt && Math.hypot(x - pt.x, y - pt.y) <= threshold) return key;
                     }
-                    // 如果点靠近中心一定范围，也视为中心拖动没拖动或者拖不动就自己修改不过要注意模块化没模块化再写的这么烂自己去处理
+                    // 如果点靠近中心一定范围，也视为中心拖动没拖动或者拖不动就自己修改不过要注意模块化。没模块化再写的这么烂自己去处理
                     if (this.flagRect) {
                         const distToCenter = Math.hypot(x - this.controlPoints.center.x, y - this.controlPoints.center.y);
                         if (distToCenter < 60) return 'center';
@@ -985,7 +985,7 @@
                     }
                 }
 
-                // ---------- 修复后的触摸处理（增量更新）----------
+                // ------触摸----------
                 handleTouchStart(e) {
                     if (!this.originalImage) return;
                     e.preventDefault();
